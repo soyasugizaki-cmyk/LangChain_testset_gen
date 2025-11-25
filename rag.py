@@ -286,7 +286,12 @@ def load_documents() -> List[Document]:
     
     return filtered_chunks
 
+# ============================================================
+# LangChain版テストセット生成（RAGAS版から変更）
+# ============================================================
+
 # テストセットのデータ構造（LangChain版）
+# RAGASのTestsetの代わりに使用
 class TestSet:
     """LangChain版のテストセットデータ構造"""
     def __init__(self, samples: List[Dict[str, Any]]):
@@ -305,14 +310,21 @@ class TestSet:
         return pd.DataFrame(data)
 
 # テストデータセットを生成（LangChain版）
+# 【変更点】RAGASのTestsetGeneratorからLangChainのプロンプトテンプレート+LLMに変更
 def create_synthesized_test_data(documents: List[Document], max_retries: int = 3):
-    """テストデータセットを生成（LangChain版、エラー時は自動リトライ）"""
+    """テストデータセットを生成（LangChain版、エラー時は自動リトライ）
+    
+    RAGAS版からの主な変更:
+    - TestsetGeneratorの代わりにChatPromptTemplateとLLMを使用
+    - 各ドキュメントから直接質問と回答を生成
+    - JSON形式で出力を受け取り、パースしてテストサンプルを作成
+    """
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     import json
     import random
     
-    # Azure OpenAIクライアント作成
+    # Azure OpenAIクライアント作成（LangChain版）
     llm = create_azure_llm(
         temperature=0.7,  # 多様な質問を生成するため少し高めに設定
         model_kwargs={
@@ -321,6 +333,7 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
     )
     
     # プロンプトテンプレート（日本語対応）
+    # LangChainのChatPromptTemplateを使用して質問と回答を生成
     qa_generation_prompt = ChatPromptTemplate.from_messages([
         ("system", """あなたはRAGシステムの評価用テストケースを生成する専門家です。
 与えられたドキュメントの内容を基に、以下のJSON形式で質問と回答のペアを生成してください。
@@ -339,7 +352,8 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
         ("human", "以下のドキュメントから質問と回答のペアを生成してください:\n\n{document}")
     ])
     
-    # チェーン構築
+    # チェーン構築（LangChain版）
+    # 【変更点】RAGAS版ではTestsetGeneratorを使用していたが、LangChain版ではプロンプトチェーンを使用
     chain = qa_generation_prompt | llm | StrOutputParser()
     
     # 段階的にサイズを減らしてリトライ
@@ -350,6 +364,8 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
             print(f"   試行 {attempt}/{len(testset_sizes)}: testset_size={size}")
             
             # ドキュメントからランダムに選択（重複を避ける）
+            # 【変更点】RAGAS版ではTestsetGeneratorが自動的にドキュメントを選択していたが、
+            # LangChain版では明示的にランダムサンプリング
             selected_docs = random.sample(documents, min(size, len(documents)))
             
             test_samples = []
@@ -362,10 +378,14 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
                     # ドキュメント内容からマーカーを除去（プロンプトに含めるため）
                     doc_content = re.sub(r'\[CHUNK_ID:[^\]]+\]\n?', '', doc.page_content)
                     
-                    # LLMで質問と回答を生成
+                    # LLMで質問と回答を生成（LangChain版）
+                    # 【変更点】RAGAS版ではTestsetGenerator.generate_with_langchain_docs()を使用していたが、
+                    # LangChain版では各ドキュメントに対して個別にLLMを呼び出し
                     response = chain.invoke({"document": doc_content})
                     
-                    # JSONをパース
+                    # JSONをパース（LangChain版）
+                    # 【変更点】RAGAS版ではTestsetGeneratorが自動的にパースしていたが、
+                    # LangChain版では明示的にJSONをパース
                     try:
                         qa_data = json.loads(response)
                         question = qa_data.get("question", "")
@@ -375,7 +395,9 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
                             print(f"   ⚠️  サンプル {idx+1}: 質問または回答が空です。スキップします。")
                             continue
                         
-                        # テストサンプルを作成
+                        # テストサンプルを作成（LangChain版のデータ構造）
+                        # 【変更点】RAGAS版ではTestsetGeneratorが自動的にTestsetオブジェクトを作成していたが、
+                        # LangChain版では辞書形式で明示的に作成
                         test_samples.append({
                             "user_input": question,
                             "reference_contexts": [doc_content],  # 元のドキュメント内容
@@ -401,7 +423,9 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
             if attempt > 1:
                 print(f"   ✓ リトライ成功（サイズ: {len(test_samples)}）")
             
-            # TestSetオブジェクトを作成
+            # TestSetオブジェクトを作成（LangChain版）
+            # 【変更点】RAGAS版ではTestsetGeneratorがTestsetオブジェクトを返していたが、
+            # LangChain版ではカスタムのTestSetクラスを使用
             testset = TestSet(test_samples)
             return testset
             
@@ -455,7 +479,10 @@ def find_chunk_ids_for_contexts(contexts: List[str], documents: List[Document]) 
     return chunk_ids
 
 def save_testset_to_cache(testset, documents: List[Document]):
-    """テストセットをキャッシュに保存（期待されるchunk_id付き、LangChain版）"""
+    """テストセットをキャッシュに保存（期待されるchunk_id付き、LangChain版）
+    
+    【変更点】RAGAS版のTestset.samplesから、LangChain版のTestSet.samples（辞書リスト）に対応
+    """
     CACHE_DIR.mkdir(exist_ok=True)
     with open(TESTSET_CACHE_FILE, "wb") as f:
         pickle.dump(testset, f)
@@ -468,7 +495,8 @@ def save_testset_to_cache(testset, documents: List[Document]):
     expected_chunk_ids_list = []
     
     for sample in testset.samples:
-        # LangChain版では、chunk_idが直接サンプルに含まれている
+        # 【LangChain版変更】RAGAS版ではsample.eval_sample.reference_context_idsを使用していたが、
+        # LangChain版ではchunk_idが直接サンプル辞書に含まれている
         chunk_id = sample.get("chunk_id")
         if chunk_id:
             chunk_ids = [chunk_id]
@@ -529,7 +557,10 @@ def create_ls_dataset(run_id: str):
         return None, None
 
 def save_test_data(testset, dataset, run_id: str):
-    """テストデータをLangSmithに保存（実行IDとタイムスタンプ付き、LangChain版）"""
+    """テストデータをLangSmithに保存（実行IDとタイムスタンプ付き、LangChain版）
+    
+    【変更点】RAGAS版のtestset_record.eval_sampleから、LangChain版の辞書形式（testset_record.get()）に対応
+    """
     if dataset is None:
         print("   LangSmithデータセットが利用できないため、スキップします。")
         return
@@ -545,7 +576,8 @@ def save_test_data(testset, dataset, run_id: str):
         timestamp = datetime.now().isoformat()
 
         for idx, testset_record in enumerate(testset.samples):
-            # LangChain版では、サンプルは辞書形式
+            # 【LangChain版変更】RAGAS版ではtestset_record.eval_sample.reference_contextsを使用していたが、
+            # LangChain版ではtestset_record.get("reference_contexts")で辞書から直接取得
             contexts = testset_record.get("reference_contexts", [])
             
             inputs.append(
