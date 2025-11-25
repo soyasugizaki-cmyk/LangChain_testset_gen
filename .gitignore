@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.local
+
+# Cache
+cache/
+*.pkl
+
+# Temporary files
+tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Chroma DB
+chroma_db/
+
+# Jupyter
+.ipynb_checkpoints/
+
