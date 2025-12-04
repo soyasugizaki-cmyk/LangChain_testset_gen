@@ -53,6 +53,10 @@ AZURE_MAX_RETRIES = 2
 DEFAULT_RETRIEVER_K = 2 # 取得するチャンク数
 TESTSET_SIZE = 10 # 生成するテストセットの数
 
+# テスト生成時の多様性確保設定
+QUESTION_SIMILARITY_THRESHOLD = 0.85  # 質問の類似度閾値（これ以上は除外）
+MAX_CHUNK_USAGE_COUNT = 2  # 同じチャンクから生成できる最大回数
+
 # Azure OpenAIの環境変数設定を確認
 def validate_azure_env_vars():
     """Azure OpenAIの環境変数を検証"""
@@ -287,11 +291,11 @@ def load_documents() -> List[Document]:
     return filtered_chunks
 
 # ============================================================
-# LangChain版テストセット生成（RAGAS版から変更）
+# LangChain版テストセット生成
 # ============================================================
 
 # テストセットのデータ構造（LangChain版）
-# RAGASのTestsetの代わりに使用
+# ここにはexpected_chunk_idsがないが、後で追加するので問題ない
 class TestSet:
     """LangChain版のテストセットデータ構造"""
     def __init__(self, samples: List[Dict[str, Any]]):
@@ -302,27 +306,45 @@ class TestSet:
         data = []
         for sample in self.samples:
             data.append({
-                "user_input": sample.get("user_input", ""),
-                "reference_contexts": sample.get("reference_contexts", []),
-                "reference": sample.get("reference", ""),
-                "synthesizer_name": sample.get("synthesizer_name", "langchain"),
+                "user_input": sample.get("user_input", ""), # 質問
+                "reference_contexts": sample.get("reference_contexts", []), # 参照コンテキスト
+                "reference": sample.get("reference", ""), # 正解
+                "synthesizer_name": sample.get("synthesizer_name", "langchain"), # 生成方法
             })
         return pd.DataFrame(data)
 
-# テストデータセットを生成（LangChain版）
+# テストデータセットを生成
 # 【変更点】RAGASのTestsetGeneratorからLangChainのプロンプトテンプレート+LLMに変更
-def create_synthesized_test_data(documents: List[Document], max_retries: int = 3):
+def create_synthesized_test_data(
+    documents: List[Document], 
+    max_retries: int = 3,
+    question_types: List[str] = None
+):
     """テストデータセットを生成（LangChain版、エラー時は自動リトライ）
     
     RAGAS版からの主な変更:
     - TestsetGeneratorの代わりにChatPromptTemplateとLLMを使用
     - 各ドキュメントから直接質問と回答を生成
     - JSON形式で出力を受け取り、パースしてテストサンプルを作成
+    
+    Args:
+        documents: ドキュメントのリスト
+        max_retries: 最大リトライ回数
+        question_types: 質問の傾向のリスト
+            - "single_hop": 単一ホップ質問（デフォルト）
+            - "multi_hop": マルチホップ質問（複数の情報を組み合わせる）
+            - "synonym": 同義語で言い換えた質問
+            - "typo": 誤字を含む質問
+            - "negation": 否定形の質問
     """
     from langchain_core.prompts import ChatPromptTemplate
     from langchain_core.output_parsers import StrOutputParser
     import json
     import random
+    
+    # デフォルト値の設定
+    if question_types is None:
+        question_types = ["single_hop"]
     
     # Azure OpenAIクライアント作成（LangChain版）
     llm = create_azure_llm(
@@ -332,10 +354,26 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
         }
     )
     
-    # プロンプトテンプレート（日本語対応）
+    # プロンプトテンプレート（日本語対応、質問の傾向を動的に組み込む）
     # LangChainのChatPromptTemplateを使用して質問と回答を生成
-    qa_generation_prompt = ChatPromptTemplate.from_messages([
-        ("system", """あなたはRAGシステムの評価用テストケースを生成する専門家です。
+    question_instructions = []
+    if "multi_hop" in question_types:
+        question_instructions.append("- 複数の情報を組み合わせて推論が必要な質問（マルチホップ）")
+    if "synonym" in question_types:
+        question_instructions.append("- 同義語や類義語を使って言い換えた質問")
+    if "typo" in question_types:
+        question_instructions.append("- 意図的な誤字やタイプミスを含む質問（例：「蓋然性」→「蓮然性」、「契約」→「k約」、「利用」→「理容」など、よくある誤字や変換ミスを含める。質問文に必ず1つ以上の誤字を含めること）")
+    if "negation" in question_types:
+        question_instructions.append("- 否定形や反対の意味を問う質問")
+    if "single_hop" in question_types or not question_instructions:
+        question_instructions.append("- ドキュメントから直接答えられる単純な質問（シングルホップ）")
+    
+    question_instructions_text = "\n".join(question_instructions)
+    
+    # プロンプトテンプレートの構築
+    # JSONの例の中の{question}と{answer}は変数として解釈されないように、
+    # 文字列リテラルとして表現（"question"と"answer"をそのまま使用）
+    system_prompt_template = """あなたはRAGシステムの評価用テストケースを生成する専門家です。
 与えられたドキュメントの内容を基に、以下のJSON形式で質問と回答のペアを生成してください。
 
 出力形式:
@@ -348,13 +386,27 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
 - ドキュメントの内容に直接関連している
 - 明確で具体的である
 - 回答がドキュメントから導き出せる
-- 日本語で記述されている"""),
-        ("human", "以下のドキュメントから質問と回答のペアを生成してください:\n\n{document}")
-    ])
+- 日本語で記述されている
+
+質問の傾向:
+{question_instructions_text}"""
     
-    # チェーン構築（LangChain版）
-    # 【変更点】RAGAS版ではTestsetGeneratorを使用していたが、LangChain版ではプロンプトチェーンを使用
-    chain = qa_generation_prompt | llm | StrOutputParser()
+    # question_instructions_textを先に置換（formatで置換）
+    system_prompt_intermediate = system_prompt_template.format(question_instructions_text=question_instructions_text)
+    
+    
+    # ChatPromptTemplateが{question}と{answer}を変数として解釈する問題を回避するため、
+    # 直接LLMを呼び出す関数を定義
+    def generate_qa(doc_content: str) -> str:
+        """ドキュメントから質問と回答を生成"""
+        from langchain_core.messages import SystemMessage, HumanMessage
+        messages = [
+            SystemMessage(content=system_prompt_intermediate),
+            HumanMessage(content=f"以下のドキュメントから質問と回答のペアを生成してください:\n\n{doc_content}")
+        ]
+        # LLMを直接呼び出し
+        response = llm.invoke(messages)
+        return response.content if hasattr(response, 'content') else str(response)
     
     # 段階的にサイズを減らしてリトライ
     testset_sizes = [TESTSET_SIZE, max(1, TESTSET_SIZE - 1), 1]
@@ -364,9 +416,9 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
             print(f"   試行 {attempt}/{len(testset_sizes)}: testset_size={size}")
             
             # ドキュメントからランダムに選択（重複を避ける）
-            # 【変更点】RAGAS版ではTestsetGeneratorが自動的にドキュメントを選択していたが、
-            # LangChain版では明示的にランダムサンプリング
-            selected_docs = random.sample(documents, min(size, len(documents)))
+            # LangChain版では明示的にランダムサンプリング、
+            # selected_docs = random.sample(documents, min(size, len(documents))) # sampleでは重複なしなので、chunk数が少ないとテストも少なくなる
+            selected_docs = random.choices(documents, k=size) # こうすることで重複ありでテストを生成することができる  
             
             test_samples = []
             for idx, doc in enumerate(selected_docs):
@@ -381,7 +433,8 @@ def create_synthesized_test_data(documents: List[Document], max_retries: int = 3
                     # LLMで質問と回答を生成（LangChain版）
                     # 【変更点】RAGAS版ではTestsetGenerator.generate_with_langchain_docs()を使用していたが、
                     # LangChain版では各ドキュメントに対して個別にLLMを呼び出し
-                    response = chain.invoke({"document": doc_content})
+                    # ChatPromptTemplateの代わりに、直接LLMを呼び出す関数を使用
+                    response = generate_qa(doc_content)
                     
                     # JSONをパース（LangChain版）
                     # 【変更点】RAGAS版ではTestsetGeneratorが自動的にパースしていたが、
@@ -724,6 +777,13 @@ def main():
         action="store_true",
         help="評価をスキップ（テストデータの生成・保存のみ実行）",
     )
+    parser.add_argument(
+        "--question-types",
+        nargs="+",
+        default=["single_hop"],
+        choices=["single_hop", "multi_hop", "synonym", "typo", "negation"],
+        help="質問の傾向を指定（複数指定可）: single_hop, multi_hop, synonym, typo, negation",
+    )
     args = parser.parse_args()
     validate_azure_env_vars()
     
@@ -746,8 +806,10 @@ def main():
     
     if testset is None or args.regenerate:
         print("🔬 テストデータを生成しています...")
+        if args.question_types:
+            print(f"   質問の傾向: {', '.join(args.question_types)}")
         try:
-            testset = create_synthesized_test_data(documents)
+            testset = create_synthesized_test_data(documents, question_types=args.question_types)
             print(f"✓ {len(testset.samples)}個のテストケースを生成しました\n")
             
             # キャッシュに保存（chunk_id情報も含める）
